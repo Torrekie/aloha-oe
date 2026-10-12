@@ -10,6 +10,7 @@
 #if defined(__APPLE__) && !defined(ALOHA_USE_OSS)
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <TargetConditionals.h>
 #include <stdatomic.h>
 
 enum { AUDIO_BUFFER_COUNT = 3, AUDIO_BUFFER_FRAMES = 4096 };
@@ -97,6 +98,35 @@ running_changed(void *opaque, AudioQueueRef queue, AudioQueuePropertyID property
         atomic_store(&p->finished, 1);
 }
 
+#if TARGET_OS_IPHONE
+/* iOS mutes the default session category when the ring/silent switch is set
+ * to silent. Media playback is not muted. The C AudioSession API is
+ * deprecated but still controls the same session as AVAudioSession, without
+ * linking anything beyond AudioToolbox. Failure here is not fatal. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+static int
+playback_session(int active)
+{
+    UInt32 category = kAudioSessionCategory_MediaPlayback;
+    OSStatus status;
+
+    if (!active)
+        return AudioSessionSetActive(false) == noErr;
+    status = AudioSessionInitialize(NULL, NULL, NULL, NULL);
+    if (status == noErr || status == kAudioSessionAlreadyInitialized)
+        status = AudioSessionSetProperty(kAudioSessionProperty_AudioCategory,
+            sizeof(category), &category);
+    if (status == noErr)
+        status = AudioSessionSetActive(true);
+    if (status != noErr)
+        fprintf(stderr, "audio: cannot select media playback session "
+            "(OSStatus %d); the silent switch may mute playback\n", (int)status);
+    return status == noErr;
+}
+#pragma GCC diagnostic pop
+#endif
+
 int
 pcm_play(const float *stereo, size_t frames, unsigned rate,
     const char *device, AudioProgress progress, void *context)
@@ -107,6 +137,9 @@ pcm_play(const float *stereo, size_t frames, unsigned rate,
     CFStringRef uid = NULL;
     OSStatus status;
     int listener_added = 0, result = 1;
+#if TARGET_OS_IPHONE
+    int session_active;
+#endif
     double start, deadline;
     size_t last_position = 0;
     int position_started = 0;
@@ -132,6 +165,9 @@ pcm_play(const float *stereo, size_t frames, unsigned rate,
     format.mBytesPerFrame = 2 * sizeof(float);
     format.mChannelsPerFrame = 2;
     format.mBitsPerChannel = CHAR_BIT * sizeof(float);
+#if TARGET_OS_IPHONE
+    session_active = playback_session(1);
+#endif
     status = AudioQueueNewOutput(&format, output_callback, p, NULL, NULL, 0,
         &queue);
     if (status != noErr)
@@ -267,6 +303,11 @@ cleanup:
     }
     if (uid != NULL)
         CFRelease(uid);
+#if TARGET_OS_IPHONE
+    /* Let audio interrupted by this session resume. */
+    if (session_active)
+        playback_session(0);
+#endif
     free(p);
     return result;
 }

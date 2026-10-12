@@ -35,6 +35,15 @@ macOS (Darwin)
         links with AudioToolbox and CoreFoundation.  Build and playback
         have been checked on macOS.
 
+iOS (jailbroken)
+        The macOS backend is used.  Before playback it selects the
+        media playback audio session, so the ring/silent switch does
+        not mute it.  Cross-compile with an iOS SDK and sign the result:
+
+        make SYSTEM=Darwin \
+             CC='clang -target arm64-apple-ios14.0 -isysroot /path/to/iPhoneOS.sdk'
+        ldid -S aloha-oe
+
 FreeBSD and DragonFly BSD
         The program uses the OSS interface in <sys/soundcard.h> and
         writes to /dev/dsp by default.
