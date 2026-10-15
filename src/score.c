@@ -13,37 +13,58 @@
 enum { NOTE_CAPACITY = 8192, LYRIC_CAPACITY = 128, KEY_SHIFT = -4 };
 
 /* Word boundaries refer to the same source note indices used by the IPA
- * syllables below. A held or multi-syllable word is printed only once. The
+ * syllables below. A word lists one '|'-separated syllable per note, matching
+ * the sung IPA; an empty syllable holds the previous one across that note.
+ * The valley note alone carries two syllables, as the voice splits it. The
  * final verse rest is deliberately absent from this table. */
 struct LyricWord { size_t first, last; const char *text; int line_end; };
 static const struct LyricWord verse_words[] = {
-    {0,1,"Proudly",0}, {2,2,"swept",0}, {3,3,"the",0},
+    {0,1,"Proud|ly",0}, {2,2,"swept",0}, {3,3,"the",0},
     {4,4,"rain",0}, {5,5,"cloud",0}, {6,6,"by",0},
     {7,7,"the",0}, {8,8,"cliffs,",1},
     {9,9,"As",0}, {10,10,"on",0}, {11,11,"it",0},
-    {12,13,"glided",0}, {14,14,"through",0}, {15,15,"the",0},
+    {12,13,"gli|ded",0}, {14,14,"through",0}, {15,15,"the",0},
     {16,16,"trees,",1},
-    {17,17,"Still",0}, {18,20,"following",0}, {21,21,"with",0},
-    {22,22,"glee",0}, {23,23,"the",0}, {24,25,"liko,",1},
-    {26,26,"The",0}, {27,29,"ʻāhihi",0}, {30,32,"lehua",0},
-    {33,33,"of",0}, {34,34,"the",0}, {35,35,"valley.",1}
+    {17,17,"Still",0}, {18,20,"fol|low|ing",0}, {21,21,"with",0},
+    {22,22,"glee",0}, {23,23,"the",0}, {24,25,"li|ko,",1},
+    {26,26,"The",0}, {27,29,"ʻā|hi|hi",0}, {30,32,"le|hu|a",0},
+    {33,33,"of",0}, {34,34,"the",0}, {35,35,"val|ley.",1}
 };
 static const struct LyricWord chorus_words[] = {
-    {0,2,"Aloha",0}, {3,3,"ʻoe,",0},
-    {4,6,"aloha",0}, {7,7,"ʻoe,",1},
-    {8,8,"E",0}, {9,9,"ke",0}, {10,13,"onaona",0},
-    {14,15,"noho",0}, {16,16,"i",0}, {17,17,"ka",0},
-    {18,19,"lipo,",1},
-    {20,20,"One",0}, {21,21,"fond",0}, {22,23,"embrace,",1},
-    {24,24,"A",0}, {25,26,"hoʻi",0}, {27,28,"aʻe",0}, {29,29,"au,",1},
-    {30,31,"Until",0}, {32,32,"we",0}, {33,34,"meet",0},
-    {35,36,"again.",1}
+    {0,2,"A|lo|ha",0}, {3,3,"ʻoe,",0},
+    {4,6,"a|lo|ha",0}, {7,7,"ʻoe,",1},
+    {8,8,"E",0}, {9,9,"ke",0}, {10,13,"o|na|o|na",0},
+    {14,15,"no|ho",0}, {16,16,"i",0}, {17,17,"ka",0},
+    {18,19,"li|po,",1},
+    {20,20,"One",0}, {21,21,"fond",0}, {22,23,"em|brace,",1},
+    {24,24,"A",0}, {25,26,"ho|ʻi",0}, {27,28,"a|ʻe",0}, {29,29,"au,",1},
+    {30,31,"Un|til",0}, {32,32,"we",0}, {33,34,"meet|",0},
+    {35,36,"a|gain.",1}
 };
 
 static int
 is_valley(const MelodyNote *notes, size_t index)
 {
     return notes == aloha_verse && index+2 == ALOHA_VERSE_NOTE_COUNT;
+}
+
+/* Count a word's syllables, and the printed (nonempty) ones among them. */
+static size_t
+word_syllables(const struct LyricWord *word, size_t *printed)
+{
+    size_t total = 1, shown = 0, length = 0;
+    for (const char *c = word->text;; ++c) {
+        if (*c == '|' || *c == '\0') {
+            shown += length != 0;
+            if (*c == '\0') break;
+            ++total;
+            length = 0;
+        } else {
+            ++length;
+        }
+    }
+    if (printed) *printed = shown;
+    return total;
 }
 
 static int
@@ -54,33 +75,60 @@ add_lyrics(struct Score *score, const MelodyNote *notes, size_t count,
     size_t word_count = notes == aloha_verse ?
         sizeof(verse_words)/sizeof(verse_words[0]) :
         sizeof(chorus_words)/sizeof(chorus_words[0]);
-    if (score->lyric_count + word_count > LYRIC_CAPACITY) {
-        errno = EOVERFLOW; return -1;
-    }
     for (size_t w = 0; w < word_count; ++w) {
         const struct LyricWord *word = &words[w];
         if (word->first > word->last || word->last >= count) {
             errno = EINVAL; return -1;
         }
-        int first_tick = start_tick, last_tick = start_tick;
-        for (size_t n = 0; n < word->last; ++n) {
-            if (n < word->first) first_tick += notes[n].ticks;
-            last_tick += notes[n].ticks;
-        }
         for (size_t n = word->first; n <= word->last; ++n)
             if (!notes[n].midi) { errno = EINVAL; return -1; }
-        double final_length = is_valley(notes, word->last) ? 2.92 :
-            (double)notes[word->last].ticks / ALOHA_PPQ * 0.97;
-        struct LyricCue cue = {
-            .start = (double)first_tick / ALOHA_PPQ * 60 / score->bpm,
-            .end = ((double)last_tick / ALOHA_PPQ + final_length) * 60 / score->bpm,
-            .text = word->text, .line_end = word->line_end
-        };
-        if (score->lyric_count &&
-            score->lyrics[score->lyric_count-1].end > cue.start) {
+        int valley = word->first == word->last && is_valley(notes, word->last);
+        size_t printed, syllables = word_syllables(word, &printed);
+        if (syllables != (valley ? 2 : word->last - word->first + 1) ||
+            word->text[0] == '|') {
             errno = EINVAL; return -1;
         }
-        score->lyrics[score->lyric_count++] = cue;
+        if (score->lyric_count + printed > LYRIC_CAPACITY) {
+            errno = EOVERFLOW; return -1;
+        }
+        int tick = start_tick;
+        for (size_t n = 0; n < word->first; ++n)
+            tick += notes[n].ticks;
+        const char *text = word->text;
+        for (size_t i = 0; i < syllables; ++i) {
+            size_t length = strcspn(text, "|");
+            /* Beats from the word's first note to this syllable and to the
+             * end of its sung note, as the voice part schedules them. */
+            double from, to;
+            if (valley) {
+                from = i ? 2.0 : 0.0;
+                to = i ? 2.92 : 2.0;
+            } else {
+                int at = tick;
+                for (size_t n = word->first; n < word->first + i; ++n)
+                    at += notes[n].ticks;
+                from = (double)(at - tick) / ALOHA_PPQ;
+                to = from + (double)notes[word->first + i].ticks / ALOHA_PPQ * 0.97;
+            }
+            double start = ((double)tick / ALOHA_PPQ + from) * 60 / score->bpm;
+            double end = ((double)tick / ALOHA_PPQ + to) * 60 / score->bpm;
+            if (length == 0) {
+                /* A held syllable extends the one before it. */
+                score->lyrics[score->lyric_count-1].end = end;
+            } else {
+                struct LyricCue cue = {
+                    .start = start, .end = end, .text = text, .length = length,
+                    .word_start = i == 0,
+                    .line_end = word->line_end && i + 1 == syllables
+                };
+                if (score->lyric_count &&
+                    score->lyrics[score->lyric_count-1].end > cue.start) {
+                    errno = EINVAL; return -1;
+                }
+                score->lyrics[score->lyric_count++] = cue;
+            }
+            text += length + (text[length] == '|');
+        }
     }
     return 0;
 }
@@ -195,7 +243,7 @@ struct Harmony { int root, fifth; int guitar[6]; int keys[4]; };
 static const struct Harmony harmony[] = {
     {40, 47, {40,47,52,56,59,64}, {52,56,59,64}},
     {45, 40, {45,52,57,61,64,69}, {57,61,64,69}},
-    {35, 42, {47,54,57,63,66,71}, {54,57,63,66}}
+    {47, 42, {47,54,57,63,66,71}, {54,57,63,66}}
 };
 
 static int
@@ -351,7 +399,9 @@ score_build(struct Score *score, enum Section section, double bpm,
                 fill(score, 72, turnaround, 4, .25, .10) ||
                 fill(score, 136, turnaround, 4, .25, .10) ||
                 fill(score, 137, coda, 6, 1.0, .17) ||
-                add_note(score, 141, 4, 64, .26, .55, INST_STEEL)) goto failed;
+                /* The final steel note sets the song's peak. Its velocity
+                 * keeps that peak where it was before the steel gain rose. */
+                add_note(score, 141, 4, 64, .167, .55, INST_STEEL)) goto failed;
             for (int i = 0; i < 6; ++i)
                 if (add_note(score, i*.003, .95, harmony[CHORD_I].guitar[i],
                     .050, -.70, INST_GUITAR)) goto failed;
@@ -396,15 +446,22 @@ failed:
 static int
 check_lyrics(const struct Score *score, enum Section section)
 {
-    size_t verse_count = sizeof(verse_words)/sizeof(verse_words[0]);
-    size_t chorus_count = sizeof(chorus_words)/sizeof(chorus_words[0]);
+    size_t verse_count = 0, chorus_count = 0, printed;
+    for (size_t w = 0; w < sizeof(verse_words)/sizeof(verse_words[0]); ++w) {
+        word_syllables(&verse_words[w], &printed);
+        verse_count += printed;
+    }
+    for (size_t w = 0; w < sizeof(chorus_words)/sizeof(chorus_words[0]); ++w) {
+        word_syllables(&chorus_words[w], &printed);
+        chorus_count += printed;
+    }
     size_t expected = section == SECTION_FULL ? verse_count+2*chorus_count :
         section == SECTION_VERSE ? verse_count : chorus_count;
     unsigned line_ends = 0;
     if (score->lyric_count != expected) return -1;
     for (size_t i = 0; i < score->lyric_count; ++i) {
         const struct LyricCue *cue = &score->lyrics[i];
-        if (!cue->text || !cue->text[0] || !isfinite(cue->start) ||
+        if (!cue->text || !cue->length || !isfinite(cue->start) ||
             !isfinite(cue->end) || cue->start < 0 || cue->end <= cue->start ||
             cue->end > score->seconds || (i && cue->start < score->lyrics[i-1].end) ||
             (cue->line_end != 0 && cue->line_end != 1)) return -1;

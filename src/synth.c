@@ -479,6 +479,7 @@ static void mix_note(struct Audio *audio, const struct Note *note,
 {
     struct Resonator guitar_body[3];
     double amplitude[PARTIALS], decay[PARTIALS];
+    double tail[PARTIALS], tail_decay[PARTIALS], tail_share = 0.0, tail_tau = 1.0;
     double f = synth_frequency(note->midi), sr = (double)audio->rate;
     double release = release_time(note->instrument), attack = 0.004;
     double step = 2.0 * PI * f / sr, cs = cos(step), sn = sin(step);
@@ -489,7 +490,9 @@ static void mix_note(struct Audio *audio, const struct Note *note,
     double noise_lp = 0.0, gain = velocity;
     size_t first, length, j;
     unsigned harmonics = 0, h;
-    unsigned limit = LEGACY_PARTIALS;
+    /* Guitar strings keep audible partials to about 5 kHz even on low notes;
+     * sixteen stopped the low E near 1.3 kHz and dulled the strums. */
+    unsigned limit = note->instrument == INST_GUITAR ? PARTIALS : LEGACY_PARTIALS;
     uint32_t seed = note_seed(note);
     static const double steel_weights[LEGACY_PARTIALS] = {
         .80, .90, .32, .14, .09, .07, .052, .039,
@@ -537,9 +540,14 @@ static void mix_note(struct Audio *audio, const struct Note *note,
             break;
         case INST_STEEL:
             a = steel_weights[h - 1];
-            tau = 5.0 / (1.0 + 0.055 * (double)(h - 1));
+            /* Held notes on the recording fade by roughly 12 dB/s at first.
+             * A quieter, slower tail keeps the steel sustaining under the
+             * other parts, so the ensemble still blends between notes. */
+            tau = 0.6 / (1.0 + 0.055 * (double)(h - 1));
+            tail_share = 0.25;
+            tail_tau = 3.0 / (1.0 + 0.055 * (double)(h - 1));
             attack = 0.020;
-            gain = velocity * 0.92;
+            gain = velocity * 1.43; /* Level matches the earlier, slower steel. */
             break;
         case INST_PIANO:
             a = 1.0 / pow((double)h, 1.50);
@@ -553,9 +561,14 @@ static void mix_note(struct Audio *audio, const struct Note *note,
             tau = 1.0;
             break;
         }
-        amplitude[h - 1] = a;
+        amplitude[h - 1] = a * (1.0 - tail_share);
         decay[h - 1] = exp(-1.0 / (tau * sr));
-        spectral_sum += fabs(a);
+        tail[h - 1] = a * tail_share;
+        tail_decay[h - 1] = exp(-1.0 / (tail_tau * sr));
+        /* Normalize on the legacy partials, so the added upper partials
+         * brighten a guitar without changing its level in the mix. */
+        if (h <= LEGACY_PARTIALS)
+            spectral_sum += fabs(a);
         ++harmonics;
     }
     if (note->attack_seconds > 0.0)
@@ -576,13 +589,14 @@ static void mix_note(struct Audio *audio, const struct Note *note,
             double fundamental_c = osc_c, fundamental_s = osc_s;
             double harmonic_c = fundamental_c, harmonic_s = fundamental_s;
             if (note->instrument == INST_STEEL || note->bend_semitones != 0.0) {
-                /* Centered phase modulation gives a restrained +/- 5.5 cent
-                 * vibrato after the attack. Its onset grows over 0.16 seconds.
-                 * Base tuning remains A4 = 440 Hz, without integer-period error. */
+                /* Centered phase modulation gives a +/- 23 cent, 5.6 Hz bar
+                 * vibrato after the attack, as measured on the recording's held
+                 * steel notes. Its onset grows over 0.16 seconds. Base tuning
+                 * remains A4 = 440 Hz, without integer-period error. */
                 double elapsed = fmax(0.0, t - 0.22);
-                double beta = f * (exp2(5.5 / 1200.0) - 1.0) / 5.1;
+                double beta = f * (exp2(23.0 / 1200.0) - 1.0) / 5.6;
                 double pm = note->instrument == INST_STEEL
-                          ? beta * sin(2.0 * PI * 5.1 * elapsed) * smooth(elapsed / 0.16) : 0.0;
+                          ? beta * sin(2.0 * PI * 5.6 * elapsed) * smooth(elapsed / 0.16) : 0.0;
                 if (note->bend_semitones != 0.0) {
                     if (note->bend_seconds > 0.0)
                         pm += slide_phase(f, t, note->bend_semitones, note->bend_seconds);
@@ -598,19 +612,26 @@ static void mix_note(struct Audio *audio, const struct Note *note,
             }
             for (h = 0; h < harmonics; ++h) {
                 double next_c;
-                signal += amplitude[h] * harmonic_s;
+                signal += (amplitude[h] + tail[h]) * harmonic_s;
                 amplitude[h] *= decay[h];
+                tail[h] *= tail_decay[h];
                 /* sin((h+1) phase), cos((h+1) phase) by a second rotation. */
                 next_c = harmonic_c * fundamental_c - harmonic_s * fundamental_s;
                 harmonic_s = harmonic_s * fundamental_c + harmonic_c * fundamental_s;
                 harmonic_c = next_c;
             }
+            /* Upper partials decay fastest. Stop rotating them once they are
+             * 80 dB below a unit partial; the full mix changes by less than
+             * 16-bit resolution, and 64-partial guitars stay affordable. */
+            while (harmonics > 0 && fabs(amplitude[harmonics - 1])
+                   + fabs(tail[harmonics - 1]) < 1e-4)
+                --harmonics;
             signal *= gain * gate(t, note->duration, attack, release);
             if (note->instrument == INST_GUITAR && t < 0.06) {
                 double n = noise(&seed);
                 noise_lp = 0.75 * noise_lp + 0.25 * n;
                 signal += (n - noise_lp) * exp(-t / 0.012)
-                        * gate(t, note->duration, attack, release) * velocity * 0.018;
+                        * gate(t, note->duration, attack, release) * velocity * 0.030;
             }
             if (note->instrument == INST_GUITAR) {
                 double body = 0.14 * resonator_sample(&guitar_body[0], signal)

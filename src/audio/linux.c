@@ -157,10 +157,41 @@ alsa_position(int fd, size_t sent, size_t total, int draining,
     return 0;
 }
 
+/* The default device is the first playback PCM listed by the kernel that is
+ * not a digital display output, so laptops whose card 0 is HDMI still play
+ * through their speakers. Without such a device, use the first playback PCM,
+ * then card 0 device 0. */
+static const char *
+default_device(char *path, size_t size)
+{
+    char line[256];
+    int found = 0, card, number;
+    FILE *list = fopen("/proc/asound/pcm", "r");
+
+    snprintf(path, size, "/dev/snd/pcmC0D0p");
+    if (list == NULL)
+        return path;
+    while (fgets(line, sizeof(line), list) != NULL) {
+        if (sscanf(line, "%d-%d:", &card, &number) != 2 ||
+            strstr(line, ": playback ") == NULL)
+            continue;
+        int display = strstr(line, "HDMI") != NULL ||
+            strstr(line, "DisplayPort") != NULL || strstr(line, " DP") != NULL;
+        if (!found || !display)
+            snprintf(path, size, "/dev/snd/pcmC%dD%dp", card, number);
+        found = 1;
+        if (!display)
+            break;
+    }
+    fclose(list);
+    return path;
+}
+
 int
 pcm_play(const float *stereo, size_t frames, unsigned rate, const char *device,
     AudioProgress progress, void *context)
 {
+    char default_path[64];
     unsigned char samples[4096];
     struct snd_xferi transfer;
     const char *operation = "opening PCM device";
@@ -169,7 +200,7 @@ pcm_play(const float *stereo, size_t frames, unsigned rate, const char *device,
     int fd, result, saved_errno;
 
     if (device == NULL || *device == '\0' || strcmp(device, "default") == 0)
-        device = "/dev/snd/pcmC0D0p";
+        device = default_device(default_path, sizeof(default_path));
     fd = open(device, O_WRONLY | O_NONBLOCK);
     if (fd < 0)
         goto fail_open;

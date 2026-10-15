@@ -50,8 +50,11 @@ FreeBSD and DragonFly BSD
 
 Linux
         The kernel ALSA headers, including <sound/asound.h>, must be
-        installed.  The program opens /dev/snd/pcmC0D0p by default.
-        It does not link with libasound or contact a sound server.
+        installed.  By default the program opens the first playback
+        device in /proc/asound/pcm that is not an HDMI or DisplayPort
+        output, such as /dev/snd/pcmC1D0p on a laptop whose card 0 is
+        HDMI.  It does not link with libasound or contact a sound
+        server.
 
 NetBSD and OpenBSD
         The program uses each system's <sys/audioio.h> interface.

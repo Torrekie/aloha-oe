@@ -44,7 +44,8 @@ Ports
                SYNC completes the drain.  A device argument is a pathname.
 
   linux.c      The ALSA kernel PCM interface in <sound/asound.h>.
-               Opens /dev/snd/pcmC0D0p unless given another pathname.
+               Unless given a pathname, opens the first non-HDMI,
+               non-DisplayPort playback PCM in /proc/asound/pcm.
                There is no libasound dependency, plugin handling, or
                interpretation of names such as "hw:0".  The device must
                accept interleaved stereo S16_LE at the requested rate,

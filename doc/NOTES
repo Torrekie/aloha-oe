@@ -79,11 +79,24 @@ Synthesis
 
 The renderer adds damped harmonic oscillators.  Each partial has its
 own decay.  Smooth attacks and releases avoid discontinuities, and
-partials are cut off below the Nyquist frequency.  Guitar adds a
-simple body resonance and pick noise.  The steel part uses a softer
-attack, vibrato and slides.  A slide integrates a smooth frequency
-curve, preserving phase and arriving at the scored destination pitch.
+partials are cut off below the Nyquist frequency.  Guitar uses up to
+64 partials, with a simple body resonance and pick noise.  The steel
+part uses a softer attack, vibrato and slides.  A slide integrates a
+smooth frequency curve, preserving phase and arriving at the scored
+destination pitch.
 Short delays and feedback provide the room sound.
+
+Some timbre settings were compared with measurements of the recording.
+Held steel notes there carry a vibrato of roughly 23 cents either way
+at about 5.6 Hz, and fade by about 12 dB per second; the steel part
+uses that vibrato.  Its notes fade quickly at first and then leave a
+quieter, slower tail, so that the steel still sustains under the
+other parts.  Its level matches the earlier, slower steel.  The guitar
+partial count and pick noise were raised until the long-term spectrum
+of the introduction and instrumental chorus was within about 4 dB of
+the recording in each octave from 80 Hz to 5 kHz.  The B7 bass root
+is B2, not B1.  The recording sits about 5 cents sharp of A4 = 440 Hz;
+the program keeps standard tuning.
 
 Direct harmonics make the pitch easy to set and check.  A
 Karplus-Strong string would need compensation for the phase delay
@@ -168,9 +181,18 @@ An offset keeps earlier note envelopes and reverberation before
 cutting the requested excerpt.  The score export describes the full
 selected section even when the audio excerpt is shortened.
 
-The 71 lyric words use the same score clock as the notes.  A word is
-written to standard output once, then flushed; phrases end with a
-newline.  An excerpt beginning inside a held word prints that word.
+The 71 lyric words, divided into 109 sung syllables, use the same
+score clock as the notes.  A syllable's letters are written to
+standard output one by one from its onset, over at most half its sung
+length and no more than 0.08 seconds apart, and output is flushed after
+each letter.  A syllable held over two notes is printed once.  On a
+colour terminal each phrase is drawn in grey up to two seconds before
+it is sung, then redrawn with its sung letters highlighted; elsewhere
+unsung text is never shown.  Phrases end with a newline.  Gaps of four
+seconds or more without singing print an instrumental marker, letter
+by letter across the gap, completing two seconds before the next
+phrase begins.  An excerpt beginning inside a word or gap first shows
+what of it has already passed.
 Playback progress comes from the selected audio driver and is polled
 by the calling thread, not printed from an audio callback.  Driver
 buffering limits the accuracy: NetBSD reports channel-buffer progress,

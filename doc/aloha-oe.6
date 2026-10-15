@@ -115,9 +115,9 @@ Equivalent to
 .BR "\-\-mode ensemble" .
 .TP
 .BR \-l , " \-\-lyrics"
-Write each word to standard output as its scheduled onset is reached
-during playback.
-Each word is flushed immediately.
+Write the lyrics to standard output during playback, letter by letter
+as each syllable is sung.
+Output is flushed after every letter.
 This is enabled by default in vocal and ensemble modes when both the
 vocal gain and master volume are nonzero.
 It may also be enabled in instrumental mode.
@@ -216,10 +216,24 @@ Timing resolution and downstream latency depend on the device and backend.
 NetBSD reports track consumption before downstream mixing and hardware
 buffering; some Windows drivers permit only buffer-completion updates.
 .PP
-Words are written once, with a newline at the end of each phrase.
-Seeking into a held word prints that word; words already completed are
+Each syllable's letters appear one by one from its onset, over at most
+half of its sung length.
+On a colour terminal, each phrase is first drawn in grey shortly before
+it is sung, and its letters are highlighted as they are reached.
+Otherwise, including when standard output is not a terminal, letters
+are only appended as they are sung and text not yet sung is not shown.
+Colour is also disabled by a nonempty
+.B NO_COLOR
+environment variable,
+.BR TERM=dumb ,
+or a terminal narrower than the longest phrase.
+A newline ends each phrase.
+Passages of four seconds or more without singing are marked with a
+\(lq\[u266A] instrumental \[u266A]\(rq line, whose letters advance evenly
+through the passage and finish two seconds before singing resumes.
+Seeking into a phrase shows what has already been sung in it (without
+colour, from the start of the current word); completed phrases are
 skipped.
-Instrumental passages produce no text.
 No lyrics are printed with
 .B \-\-no-play
 or during a standalone
@@ -239,7 +253,11 @@ An OSS device pathname; the default is
 .BR /dev/dsp .
 .TP
 .B Linux
-An ALSA kernel PCM playback node; the default is
+An ALSA kernel PCM playback node.
+The default is the first playback device listed in
+.I /proc/asound/pcm
+that is not an HDMI or DisplayPort output, or failing that the first
+playback device, or
 .BR /dev/snd/pcmC0D0p .
 ALSA library names such as
 .B hw:0

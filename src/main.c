@@ -1,3 +1,6 @@
+#if defined(__linux__)
+#define _DEFAULT_SOURCE  /* isatty, fileno and TIOCGWINSZ under -std=c11 */
+#endif
 #include "audio.h"
 #include "score.h"
 #include "synth.h"
@@ -16,6 +19,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <direct.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#else
+#include <sys/ioctl.h>
+#include <unistd.h>
 #endif
 
 #define PI 3.14159265358979323846
@@ -24,57 +33,320 @@ static const char *const part_names[PART_COUNT] = {
     "guitar", "bass", "steel", "piano", "percussion", "vocal"
 };
 
+/* Lyric display. Each syllable's letters appear one by one from its onset.
+ * On a colour terminal a phrase is first drawn unsung (grey), shortly before
+ * it begins, and its letters are highlighted as they are sung. Without colour
+ * (pipes, files, NO_COLOR, TERM=dumb, or a phrase wider than the terminal)
+ * letters are simply appended, and unsung text is never shown. Long passages
+ * without singing are marked as instrumental; the marker's letters advance
+ * evenly through the passage, finishing as the next phrase is previewed. */
+enum { LYRIC_LINE_BYTES = 256, LYRIC_LINE_CUES = 32 };
+#define LYRIC_LETTER_SECONDS 0.08
+#define LYRIC_PREVIEW_SECONDS 2.0
+#define LYRIC_GAP_SECONDS 4.0
+#define LYRIC_SUNG "\x1b[1;33m"
+#define LYRIC_UNSUNG "\x1b[90m"
+#define LYRIC_MARK "\x1b[36m"
+#define LYRIC_RESET "\x1b[0m"
+static const char instrumental_mark[] = "\xe2\x99\xaa instrumental \xe2\x99\xaa";
+
 struct LyricStream {
     const struct Score *score;
     size_t next, first_frame, frames;
     unsigned rate;
-    int line_open, failed;
+    int color, failed;
+    /* The phrase being shown: cues [next, last], its text and cue offsets,
+     * or (marking) the instrumental marker timed from mark_from to mark_until. */
+    int active, marking, drawn, written, gap_marked, trailing_marked, seeked;
+    double mark_from, mark_until;
+    size_t last, length, shown, printed, cues;
+    size_t offset[LYRIC_LINE_CUES];
+    char text[LYRIC_LINE_BYTES];
+    double previous_end;
+#ifdef _WIN32
+    HANDLE console;
+    DWORD console_mode;
+    int restore_console;
+#endif
 };
 
+static size_t
+utf8_letters(const char *text, size_t length)
+{
+    size_t letters = 0;
+    for (size_t i = 0; i < length; ++i)
+        letters += ((unsigned char)text[i] & 0xC0) != 0x80;
+    return letters;
+}
+
+/* Index of the last cue of the phrase beginning at cue `first`. */
+static size_t
+lyric_phrase_end(const struct Score *score, size_t first)
+{
+    size_t last = first;
+    while (last + 1 < score->lyric_count && !score->lyrics[last].line_end)
+        ++last;
+    return last;
+}
+
+static int
+lyric_build(struct LyricStream *stream)
+{
+    const struct LyricCue *lyrics = stream->score->lyrics;
+    stream->length = 0;
+    stream->cues = 0;
+    for (size_t i = stream->next; i <= stream->last; ++i) {
+        size_t space = i > stream->next && lyrics[i].word_start;
+        if (stream->cues == LYRIC_LINE_CUES ||
+            stream->length + space + lyrics[i].length >= LYRIC_LINE_BYTES)
+            return -1;
+        if (space)
+            stream->text[stream->length++] = ' ';
+        stream->offset[stream->cues++] = stream->length;
+        memcpy(stream->text + stream->length, lyrics[i].text, lyrics[i].length);
+        stream->length += lyrics[i].length;
+    }
+    return 0;
+}
+
+/* Bytes of the phrase revealed at `now`, counting only letters timed before
+ * the end of the excerpt. Letters of a syllable are spread over at most half
+ * its sung length, and at most LYRIC_LETTER_SECONDS apart. */
+static size_t
+lyric_revealed(const struct LyricStream *stream, double now, double limit)
+{
+    const struct LyricCue *lyrics = stream->score->lyrics;
+    size_t revealed = 0;
+    if (stream->marking) {
+        size_t letters = utf8_letters(stream->text, stream->length), k = 0;
+        for (size_t i = 0; i < stream->length; ++i) {
+            if (((unsigned char)stream->text[i] & 0xC0) == 0x80)
+                continue;
+            double at = stream->mark_from + (stream->mark_until - stream->mark_from)
+                * (double)k++ / (double)letters;
+            if (at > now || at >= limit)
+                return revealed;
+            revealed = i + 1;
+            while (revealed < stream->length &&
+                ((unsigned char)stream->text[revealed] & 0xC0) == 0x80)
+                ++revealed;
+        }
+        return revealed;
+    }
+    for (size_t c = 0; c < stream->cues; ++c) {
+        const struct LyricCue *cue = &lyrics[stream->next + c];
+        size_t letters = utf8_letters(cue->text, cue->length), k = 0;
+        double span = fmin(0.5 * (cue->end - cue->start),
+            LYRIC_LETTER_SECONDS * (double)letters);
+        for (size_t i = 0; i < cue->length; ++i) {
+            if (((unsigned char)cue->text[i] & 0xC0) == 0x80)
+                continue;
+            double at = cue->start + span * (double)k++ / (double)letters;
+            if (at > now || at >= limit)
+                return revealed;
+            /* Include this letter's continuation bytes. */
+            size_t next = i + 1;
+            while (next < cue->length &&
+                ((unsigned char)cue->text[next] & 0xC0) == 0x80)
+                ++next;
+            revealed = stream->offset[c] + next;
+        }
+    }
+    return revealed;
+}
+
+static void
+lyric_draw(struct LyricStream *stream, size_t revealed)
+{
+    fputs(stream->marking ? "\r" LYRIC_MARK : "\r" LYRIC_SUNG, stdout);
+    fwrite(stream->text, 1, revealed, stdout);
+    fputs(LYRIC_UNSUNG, stdout);
+    fwrite(stream->text + revealed, 1, stream->length - revealed, stdout);
+    fputs(LYRIC_RESET "\x1b[K", stdout);
+    stream->drawn = 1;
+    stream->shown = revealed;
+}
+
+/* Mark a gap of at least LYRIC_GAP_SECONDS from `from` to `to` once. Returns
+ * 0 if there is nothing (more) to mark, 1 while the marker waits for `now`,
+ * and 2 when the marker has become the active line. Its letters are timed
+ * from the start of the gap, so a seek into it shows the elapsed part. */
+static int
+lyric_gap(struct LyricStream *stream, int *marked, double from, double to,
+    double now, double begin, double limit)
+{
+    double at = fmax(from, begin);
+    if (*marked || to - from < LYRIC_GAP_SECONDS || at >= to || at >= limit)
+        return 0;
+    if (now < at)
+        return 1;
+    stream->length = sizeof(instrumental_mark) - 1;
+    memcpy(stream->text, instrumental_mark, stream->length);
+    stream->cues = 0;
+    stream->mark_from = from;
+    stream->mark_until = to - LYRIC_PREVIEW_SECONDS;
+    stream->active = stream->marking = *marked = 1;
+    stream->drawn = stream->written = 0;
+    stream->shown = stream->printed = 0;
+    return 2;
+}
+
 /* Called on the playback control thread from the device's sample position.
- * Flush each whole word so pipes and terminals both see incremental text.
- * A seek into a held word prints that word once; completed words are skipped. */
+ * Output is flushed after every change, so pipes and terminals alike see
+ * each letter as it is sung. A seek into a phrase shows (or, without colour,
+ * prints from the start of the current word) what has already been sung;
+ * completed phrases are skipped. */
 static void
 lyric_progress(void *context, size_t played_frames)
 {
     struct LyricStream *stream = context;
+    const struct LyricCue *lyrics = stream->score->lyrics;
     if (stream->failed)
         return;
-    size_t absolute = stream->first_frame + played_frames;
-    size_t limit = stream->first_frame + stream->frames;
-    while (stream->next < stream->score->lyric_count) {
-        const struct LyricCue *cue = &stream->score->lyrics[stream->next];
-        size_t start = (size_t)llround(cue->start * stream->rate);
-        size_t end = (size_t)llround(cue->end * stream->rate);
-        if (end <= stream->first_frame) {
-            ++stream->next;
+    double begin = (double)stream->first_frame / stream->rate;
+    double now = (double)(stream->first_frame + played_frames) / stream->rate;
+    double limit = (double)(stream->first_frame + stream->frames) / stream->rate;
+    int changed = 0;
+    for (;;) {
+        if (!stream->active) {
+            if (stream->next >= stream->score->lyric_count) {
+                if (lyric_gap(stream, &stream->trailing_marked, stream->previous_end,
+                    stream->score->seconds, now, begin, limit) == 2)
+                    continue;
+                break;
+            }
+            size_t last = lyric_phrase_end(stream->score, stream->next);
+            double first_start = lyrics[stream->next].start;
+            if (lyrics[last].end <= begin) {
+                stream->previous_end = lyrics[last].end;
+                stream->next = last + 1;
+                continue;
+            }
+            int gap = lyric_gap(stream, &stream->gap_marked,
+                stream->previous_end, first_start, now, begin, limit);
+            if (gap == 2)
+                continue;
+            if (gap == 1 || first_start >= limit)
+                break;
+            double appear = stream->color ?
+                fmax(first_start - LYRIC_PREVIEW_SECONDS, stream->previous_end) :
+                first_start;
+            if (now < appear)
+                break;
+            stream->last = last;
+            if (lyric_build(stream) != 0) {
+                fputs("lyrics: phrase too long to display\n", stderr);
+                stream->failed = 1;
+                return;
+            }
+            stream->active = 1;
+            stream->drawn = stream->written = 0;
+            stream->shown = stream->printed = 0;
+            if (!stream->seeked) {
+                /* Without colour, a seek prints from the current word on. */
+                size_t c = stream->next;
+                while (c < last && lyrics[c].end <= begin)
+                    ++c;
+                while (c > stream->next && !lyrics[c].word_start)
+                    --c;
+                stream->printed = stream->offset[c - stream->next];
+                stream->seeked = 1;
+            }
+        }
+        size_t revealed = lyric_revealed(stream, now, limit);
+        if (stream->color) {
+            if (!stream->drawn || revealed != stream->shown) {
+                lyric_draw(stream, revealed);
+                changed = 1;
+            }
+        } else if (revealed > stream->printed) {
+            fwrite(stream->text + stream->printed, 1,
+                revealed - stream->printed, stdout);
+            stream->printed = revealed;
+            stream->written = changed = 1;
+        }
+        if (revealed < stream->length)
+            break;
+        fputc('\n', stdout);
+        changed = 1;
+        stream->active = 0;
+        if (stream->marking) {
+            stream->marking = 0;  /* The phrase that follows is still due. */
             continue;
         }
-        if (start >= limit || start > absolute)
-            break;
-        if (stream->line_open)
-            fputc(' ', stdout);
-        fputs(cue->text, stdout);
-        stream->line_open = !cue->line_end;
-        if (cue->line_end)
-            fputc('\n', stdout);
-        ++stream->next;
-        if (fflush(stdout) == EOF || ferror(stdout)) {
-            stream->failed = 1;
-            break;
-        }
+        stream->previous_end = lyrics[stream->last].end;
+        stream->next = stream->last + 1;
+        stream->gap_marked = 0;
     }
+    if (changed && (fflush(stdout) == EOF || ferror(stdout)))
+        stream->failed = 1;
+}
+
+/* Choose colour output for an interactive terminal wide enough for every
+ * phrase. NO_COLOR (https://no-color.org) and TERM=dumb disable it. */
+static void
+lyric_start(struct LyricStream *stream)
+{
+    const char *no_color = getenv("NO_COLOR"), *term = getenv("TERM");
+    size_t widest = 0, columns = 0;
+    if (no_color && no_color[0])
+        return;
+    for (size_t i = 0; i < stream->score->lyric_count;) {
+        size_t last = lyric_phrase_end(stream->score, i), width = 0;
+        for (size_t c = i; c <= last; ++c)
+            width += utf8_letters(stream->score->lyrics[c].text,
+                stream->score->lyrics[c].length)
+                + (c > i && stream->score->lyrics[c].word_start);
+        if (width > widest)
+            widest = width;
+        i = last + 1;
+    }
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    stream->console = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!GetConsoleMode(stream->console, &stream->console_mode) ||
+        !GetConsoleScreenBufferInfo(stream->console, &info))
+        return;
+    columns = (size_t)(info.srWindow.Right - info.srWindow.Left + 1);
+    if (widest >= columns)
+        return;
+    if (!(stream->console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        if (!SetConsoleMode(stream->console,
+            stream->console_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+            return;
+        stream->restore_console = 1;
+    }
+    (void)term;
+#else
+    struct winsize size;
+    if (!isatty(STDOUT_FILENO) || (term && !strcmp(term, "dumb")))
+        return;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0)
+        columns = size.ws_col;
+    if (columns == 0)
+        columns = 80;
+    if (widest >= columns)
+        return;
+#endif
+    stream->color = 1;
 }
 
 static int
 lyric_finish(struct LyricStream *stream)
 {
-    if (stream->line_open) {
-        fputc('\n', stdout);
-        stream->line_open = 0;
+    if (stream->active && !stream->failed) {
+        if (stream->color && stream->shown == 0)
+            fputs("\r\x1b[K", stdout);  /* Erase a phrase never reached. */
+        else if (stream->color || stream->written)
+            fputc('\n', stdout);
+        stream->active = 0;
         if (fflush(stdout) == EOF || ferror(stdout))
             stream->failed = 1;
     }
+#ifdef _WIN32
+    if (stream->restore_console)
+        SetConsoleMode(stream->console, stream->console_mode);
+#endif
     if (stream->failed) {
         fputs("lyrics: writing to standard output failed\n", stderr);
         return 1;
@@ -488,6 +760,8 @@ program_main(int argc, char **argv)
         struct LyricStream stream = { .score=&score, .first_frame=first,
             .frames=audio.frames, .rate=audio.rate };
         AudioProgress progress = show_lyrics && score.lyric_count ? lyric_progress : NULL;
+        if (progress != NULL)
+            lyric_start(&stream);
         result = play_audio_with_progress(audio.samples, audio.frames, audio.rate,
             opts.device, progress, &stream) != 0;
         if (progress != NULL && lyric_finish(&stream))
